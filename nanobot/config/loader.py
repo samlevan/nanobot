@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from nanobot.config.schema import Config
+from nanobot.config.secret_resolver import resolve_config
 
 
 # Global variable to store current config path (for multi-instance support)
@@ -40,6 +41,7 @@ def load_config(config_path: Path | None = None) -> Config:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             data = _migrate_config(data)
+            data = resolve_config(data)  # Resolve {env:VAR} references
             return Config.model_validate(data)
         except (json.JSONDecodeError, ValueError) as e:
             print(f"Warning: Failed to load config from {path}: {e}")
