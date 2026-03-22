@@ -2,7 +2,7 @@
 
 import asyncio
 from contextlib import AsyncExitStack
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import httpx
 from loguru import logger
@@ -77,14 +77,17 @@ def _normalize_schema_for_openai(schema: Any) -> dict[str, Any]:
 class MCPToolWrapper(Tool):
     """Wraps a single MCP server tool as a nanobot Tool."""
 
-    def __init__(self, session, server_name: str, tool_def, tool_timeout: int = 30):
+    def __init__(self, session, server_name: str, tool_def, tool_timeout: int = 30,
+                 reconnect_callback: "Callable[[], Awaitable[None]] | None" = None):
         self._session = session
+        self._server_name = server_name
         self._original_name = tool_def.name
         self._name = f"mcp_{server_name}_{tool_def.name}"
         self._description = tool_def.description or tool_def.name
         raw_schema = tool_def.inputSchema or {"type": "object", "properties": {}}
         self._parameters = _normalize_schema_for_openai(raw_schema)
         self._tool_timeout = tool_timeout
+        self._reconnect_callback = reconnect_callback
 
     @property
     def name(self) -> str:
@@ -98,14 +101,36 @@ class MCPToolWrapper(Tool):
     def parameters(self) -> dict[str, Any]:
         return self._parameters
 
-    async def execute(self, **kwargs: Any) -> str:
+    def update_session(self, session) -> None:
+        """Replace the underlying MCP session (called after reconnect)."""
+        self._session = session
+
+    async def _call_tool(self, **kwargs: Any) -> str:
         from mcp import types
 
+        result = await asyncio.wait_for(
+            self._session.call_tool(self._original_name, arguments=kwargs),
+            timeout=self._tool_timeout,
+        )
+        parts = []
+        for block in result.content:
+            if isinstance(block, types.TextContent):
+                parts.append(block.text)
+            else:
+                parts.append(str(block))
+        return "\n".join(parts) or "(no output)"
+
+    def _is_session_dead(self, exc: Exception) -> bool:
+        """Check if the exception indicates a dead/terminated MCP session."""
+        from mcp.shared.exceptions import McpError
+        if isinstance(exc, McpError):
+            msg = str(exc).lower()
+            return "session terminated" in msg or "session closed" in msg
+        return False
+
+    async def execute(self, **kwargs: Any) -> str:
         try:
-            result = await asyncio.wait_for(
-                self._session.call_tool(self._original_name, arguments=kwargs),
-                timeout=self._tool_timeout,
-            )
+            return await self._call_tool(**kwargs)
         except asyncio.TimeoutError:
             logger.warning("MCP tool '{}' timed out after {}s", self._name, self._tool_timeout)
             return f"(MCP tool call timed out after {self._tool_timeout}s)"
@@ -118,6 +143,21 @@ class MCPToolWrapper(Tool):
             logger.warning("MCP tool '{}' was cancelled by server/SDK", self._name)
             return "(MCP tool call was cancelled)"
         except Exception as exc:
+            if self._is_session_dead(exc) and self._reconnect_callback is not None:
+                logger.warning(
+                    "MCP tool '{}': session terminated, attempting reconnect...", self._name
+                )
+                try:
+                    await self._reconnect_callback()
+                    return await self._call_tool(**kwargs)
+                except Exception as retry_exc:
+                    logger.exception(
+                        "MCP tool '{}' failed after reconnect: {}: {}",
+                        self._name,
+                        type(retry_exc).__name__,
+                        retry_exc,
+                    )
+                    return f"(MCP tool call failed after reconnect: {type(retry_exc).__name__})"
             logger.exception(
                 "MCP tool '{}' failed: {}: {}",
                 self._name,
@@ -126,17 +166,10 @@ class MCPToolWrapper(Tool):
             )
             return f"(MCP tool call failed: {type(exc).__name__})"
 
-        parts = []
-        for block in result.content:
-            if isinstance(block, types.TextContent):
-                parts.append(block.text)
-            else:
-                parts.append(str(block))
-        return "\n".join(parts) or "(no output)"
-
 
 async def connect_mcp_servers(
-    mcp_servers: dict, registry: ToolRegistry, stack: AsyncExitStack
+    mcp_servers: dict, registry: ToolRegistry, stack: AsyncExitStack,
+    reconnect_callback: "Callable[[], Awaitable[None]] | None" = None,
 ) -> None:
     """Connect to configured MCP servers and register their tools."""
     from mcp import ClientSession, StdioServerParameters
@@ -221,7 +254,8 @@ async def connect_mcp_servers(
                         name,
                     )
                     continue
-                wrapper = MCPToolWrapper(session, name, tool_def, tool_timeout=cfg.tool_timeout)
+                wrapper = MCPToolWrapper(session, name, tool_def, tool_timeout=cfg.tool_timeout,
+                                        reconnect_callback=reconnect_callback)
                 registry.register(wrapper)
                 logger.debug("MCP: registered tool '{}' from server '{}'", wrapper.name, name)
                 registered_count += 1

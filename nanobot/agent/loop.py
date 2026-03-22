@@ -148,7 +148,10 @@ class AgentLoop:
         try:
             self._mcp_stack = AsyncExitStack()
             await self._mcp_stack.__aenter__()
-            await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
+            await connect_mcp_servers(
+                self._mcp_servers, self.tools, self._mcp_stack,
+                reconnect_callback=self._reconnect_mcp,
+            )
             self._mcp_connected = True
         except BaseException as e:
             logger.error("Failed to connect MCP servers (will retry next message): {}", e)
@@ -160,6 +163,27 @@ class AgentLoop:
                 self._mcp_stack = None
         finally:
             self._mcp_connecting = False
+
+    async def _reconnect_mcp(self) -> None:
+        """Tear down dead MCP sessions and reconnect all servers."""
+        if self._mcp_connecting:
+            # Another reconnect is already in progress; wait for it.
+            while self._mcp_connecting:
+                await asyncio.sleep(0.1)
+            return
+        logger.info("Reconnecting MCP servers...")
+        # Tear down old stack
+        if self._mcp_stack:
+            try:
+                await self._mcp_stack.aclose()
+            except Exception:
+                pass
+            self._mcp_stack = None
+        # Unregister old MCP tools
+        self.tools.unregister_prefix("mcp_")
+        # Reset state so _connect_mcp runs again
+        self._mcp_connected = False
+        await self._connect_mcp()
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
